@@ -177,4 +177,13 @@ def main():
                             "结束日期": orig_meta.get(end_col, "")
                         })
                     
-                    res_df = pd.DataFrame(
+                    res_df = pd.DataFrame(output_data)
+                    st.dataframe(res_df)
+                    
+                    excel_out = io.BytesIO()
+                    with pd.ExcelWriter(excel_out, engine='openpyxl') as writer:
+                        res_df.to_excel(writer, index=False)
+                    st.download_button("📥 下载 Excel", excel_out.getvalue(), "Fixed_Coupons.xlsx")
+
+if __name__ == "__main__":
+    main()
