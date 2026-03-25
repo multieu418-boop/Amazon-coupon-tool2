@@ -4,186 +4,180 @@ import re
 import math
 import io
 
-st.set_page_config(page_title="Amazon Coupon 报错修复工具", layout="wide")
+st.set_page_config(page_title="Amazon Coupon 修复重组工具", layout="wide")
 
-# --- 1. 智能解析报错信息 ---
+# --- 1. 智能解析报错详情 ---
 def parse_error_details(error_msg):
     error_map = {}
     if pd.isna(error_msg) or str(error_msg).strip() == "": 
         return error_map
     
-    # 正则提取：10位ASIN + 报错内容
+    # 尝试匹配 ASIN(10位) + 换行 + 报错内容
     blocks = re.split(r'([A-Z0-9]{10})\n', str(error_msg))
-    for i in range(1, len(blocks), 2):
-        asin = blocks[i].strip()
-        content = blocks[i+1]
-        # 寻找“要求的净价格”
-        req_price_match = re.search(r'要求的净价格：[^\d]*([\d\.]+)', content)
+    if len(blocks) > 1:
+        for i in range(1, len(blocks), 2):
+            asin = blocks[i].strip()
+            content = blocks[i+1]
+            req_price_match = re.search(r'要求的净价格：[^\d]*([\d\.]+)', content)
+            req_price = float(req_price_match.group(1)) if req_price_match else None
+            error_map[asin] = {"req_price": req_price, "msg": content.strip()}
+    else:
+        # 针对单行报错的兜底逻辑
+        req_price_match = re.search(r'要求的净价格：[^\d]*([\d\.]+)', str(error_msg))
         req_price = float(req_price_match.group(1)) if req_price_match else None
-        is_no_ref = "没有经验证" in content
-        error_map[asin] = {"req_price": req_price, "is_no_ref": is_no_ref, "msg": content.strip()}
+        error_map["GLOBAL"] = {"req_price": req_price, "msg": str(error_msg)}
     return error_map
 
-# --- 2. 智能读取亚马逊报错模板 (跳过说明行) ---
-def load_amazon_error_file(file):
-    if file is None: return None
-    try:
-        # 读取前 20 行来定位表头
-        df_scan = pd.read_excel(file, header=None, nrows=20)
-        header_idx = 0
-        for i, row in df_scan.iterrows():
-            row_content = "".join([str(x) for x in row.values]).lower()
-            # 只要包含这几个核心词，就认为是表头行
-            if 'asin' in row_content or 'discount' in row_content or '折扣' in row_content:
-                header_idx = i
-                break
-        
-        file.seek(0)
-        df = pd.read_excel(file, header=header_idx)
-        df.columns = [str(c).strip().lower() for c in df.columns]
-        # 过滤掉全空行
-        df = df.dropna(how='all').reset_index(drop=True)
-        return df
-    except Exception as e:
-        st.error(f"解析报错模板失败: {e}")
-        return None
-
-# --- 3. 智能读取 All Listing (支持多格式/多编码) ---
-def load_listing_file(file):
+# --- 2. 针对性读取函数：跳过说明与举例 ---
+def load_amazon_template(file):
     if file is None: return None
     fname = file.name.lower()
     try:
-        df = None
-        if fname.endswith('.txt'):
-            for enc in ['utf-8', 'utf-16', 'gbk', 'utf-8-sig']:
-                try:
-                    file.seek(0)
-                    df = pd.read_csv(file, sep='\t', encoding=enc)
-                    if not df.empty: break
-                except: continue
-        elif fname.endswith('.csv'):
-            df = pd.read_csv(file)
-        else:
-            df = pd.read_excel(file)
+        # 判定文件类型
+        is_csv = fname.endswith('.csv') or (fname.endswith('.xlsx') and 'csv' in fname)
         
-        if df is not None:
-            df.columns = [str(c).strip().lower() for c in df.columns]
-            return df
+        if is_csv:
+            # CSV 处理：第7行是表头(index=6)，从第10行开始是数据(即跳过表头后的前3行)
+            df = pd.read_csv(file, header=6, encoding='utf-8-sig') # 自动识别常见CSV编码
+            # 跳过第8-9行（即读取后的前两行索引为0, 1的数据）
+            df = df.iloc[2:].reset_index(drop=True)
+        else:
+            # Excel 处理：第7行是表头(index=6)
+            df = pd.read_excel(file, header=6)
+            # 跳过举例行
+            df = df.iloc[2:].reset_index(drop=True)
+
+        # 统一列名格式
+        df.columns = [str(c).strip().lower() for c in df.columns]
+        # 彻底过滤掉全空行
+        df = df.dropna(how='all').reset_index(drop=True)
+        return df
     except Exception as e:
-        st.error(f"读取 Listing 失败: {e}")
+        st.error(f"解析模板失败: {e}。请检查文件格式是否正确。")
         return None
 
+# --- 3. Listing 文件读取 ---
+def load_listing_file(file):
+    if file is None: return None
+    try:
+        fname = file.name.lower()
+        if fname.endswith('.txt'):
+            file.seek(0)
+            df = pd.read_csv(file, sep='\t', encoding='utf-8')
+        elif fname.endswith('.csv'):
+            file.seek(0)
+            df = pd.read_csv(file)
+        else:
+            file.seek(0)
+            df = pd.read_excel(file)
+        df.columns = [str(c).strip().lower() for c in df.columns]
+        return df
+    except:
+        # 编码重试逻辑
+        file.seek(0)
+        return pd.read_csv(file, sep='\t', encoding='gbk')
+
 def main():
-    st.title("🎯 Amazon Coupon 智能修复重组")
+    st.title("🎯 Amazon Coupon 报错精准剥离系统")
     st.markdown("---")
 
-    col_l, col_r = st.columns(2)
-    with col_l:
+    col1, col2 = st.columns(2)
+    with col1:
         l_file = st.file_uploader("1. 上传 All Listing 表", type=['txt', 'xlsx', 'csv'])
-    with col_r:
-        e_file = st.file_uploader("2. 上传亚马逊报错的 Excel 模板", type=['xlsx'])
+    with col2:
+        e_file = st.file_uploader("2. 上传亚马逊报错模板 (CSV/XLSX)", type=['xlsx', 'csv'])
 
     if l_file and e_file:
         df_l = load_listing_file(l_file)
-        df_e = load_amazon_error_file(e_file)
+        df_e = load_amazon_template(e_file)
 
         if df_l is not None and df_e is not None:
-            # 定位 Listing 的 ASIN 和 Price 列
+            # 列名自动定位
             l_asin_col = next((c for c in df_l.columns if 'asin' in c), None)
             l_price_col = next((c for c in df_l.columns if 'price' in c), None)
+            
+            # 报错模板中的列（根据你的描述和截图）
+            e_asin_col = next((c for c in df_e.columns if 'asin' in c and ('list' in c or '列表' in c)), df_e.columns[0])
+            e_err_col = next((c for c in df_e.columns if any(k in c for k in ['error', '结果', '错误', 'summary'])), df_e.columns[-1])
 
-            # 定位 报错模板 的 ASIN List 和 Error 列
-            e_asin_col = next((c for c in df_e.columns if 'asin' in c and 'list' in c or 'asin列表' in c), None)
-            e_error_col = next((c for c in df_e.columns if 'error' in c or '处理结果' in c or '批注' in c or 'summary' in c), df_e.columns[-1])
-
-            # 抓取原始信息用于重组
-            budget_col = next((c for c in df_e.columns if 'budget' in c or '预算' in c), None)
-            discount_col = next((c for c in df_e.columns if 'discount' in c or '折扣' in c), None)
-            start_col = next((c for c in df_e.columns if 'start' in c or '开始' in c), None)
-            end_col = next((c for c in df_e.columns if 'end' in c or '结束' in c), None)
-
-            # --- 拆解 ASIN ---
-            all_items = []
+            # --- 核心逻辑：拆解 ASIN 并归类 ---
+            rows = []
             for idx, row in df_e.iterrows():
                 asin_str = str(row.get(e_asin_col, ""))
-                if asin_str == "nan" or not asin_str: continue
+                if not asin_str or asin_str == "nan": continue
                 
-                error_map = parse_error_details(str(row.get(e_error_col, "")))
-                asins = [a.strip() for a in asin_str.replace(',', ';').split(';') if a.strip()]
+                err_text = str(row.get(e_err_col, ""))
+                err_map = parse_error_details(err_text)
+                # 兼容分号、逗号和空格拆分
+                asins = [a.strip() for a in re.split(r'[;,\s]+', asin_str) if a.strip()]
                 
                 for a in asins:
-                    # 匹配原价
-                    price_match = df_l[df_l[l_asin_col] == a][l_price_col].values if l_asin_col else []
-                    price = price_match[0] if len(price_match) > 0 else None
+                    p_match = df_l[df_l[l_asin_col] == a][l_price_col].values if l_asin_col else []
+                    price = p_match[0] if len(p_match) > 0 else None
                     
-                    is_err = a in error_map
-                    all_items.append({
-                        "原始行": idx + 1,
+                    is_err = a in err_map or (len(asins) == 1 and "GLOBAL" in err_map)
+                    specific_err = err_map.get(a, err_map.get("GLOBAL", {}))
+                    
+                    rows.append({
+                        "原始行": idx + 10, # 对应 Excel 真实行号
                         "ASIN": a,
                         "状态": "❌ 报错" if is_err else "✅ 正常",
                         "原价": price,
-                        "要求净价": error_map[a]['req_price'] if is_err else None,
-                        "建议折扣": 0, # 待计算
-                        "报错原因": error_map[a]['msg'] if is_err else "正常",
-                        "原始折扣": row.get(discount_col, 5),
+                        "要求净价": specific_err.get('req_price'),
+                        "报错原因": specific_err.get('msg', "正常"),
+                        "原始折扣": row.get('折扣百分比', row.get('优惠券“折扣”数值', 5)),
                         "meta": row.to_dict()
                     })
 
-            df_work = pd.DataFrame(all_items)
+            df_work = pd.DataFrame(rows)
 
-            # 计算建议折扣
-            def calc_logic(r):
+            # 计算修复折扣
+            def calc_repair(r):
                 if r['状态'] == "✅ 正常": return r['原始折扣']
-                if "没有经验证" in r['报错原因']: return 0
-                if pd.notnull(r['原价']) and pd.notnull(r['要求净价']):
+                if r['要求净价'] and r['原价']:
                     needed = math.ceil(((r['原价'] - r['要求净价']) / r['原价']) * 100)
+                    # 如果计算出的折扣过大（如超过50%），标记为待核实或剔除
                     return max(needed, 5)
                 return 0
 
-            df_work['建议折扣'] = df_work.apply(calc_logic, axis=1)
-            df_work['保留'] = df_work['建议折扣'] > 0
+            df_work['修复折扣'] = df_work.apply(calc_repair, axis=1)
+            df_work['保留'] = df_work['修复折扣'] > 0
 
-            # --- 展示界面 ---
-            st.subheader("🛠️ ASIN 修复决策工作台")
+            st.subheader("🔍 数据处理预览 (已跳过举例行)")
             edited_df = st.data_editor(
-                df_work[['保留', 'ASIN', '状态', '建议折扣', '原价', '要求净价', '报错原因', '原始行']],
-                column_config={
-                    "建议折扣": st.column_config.NumberColumn("拟用折扣%", format="%d%%"),
-                    "保留": st.column_config.CheckboxColumn("确认保留?", default=True)
-                },
+                df_work[['保留', 'ASIN', '状态', '修复折扣', '原价', '要求净价', '报错原因', '原始行']],
+                column_config={"修复折扣": st.column_config.NumberColumn("拟提报%", format="%d%%")},
                 disabled=['ASIN', '状态', '原价', '要求净价', '报错原因', '原始行'],
                 hide_index=True
             )
 
-            # --- 归纳导出 ---
-            if st.button("🚀 生成并下载修复后的提报文件"):
-                final = edited_df[edited_df['保留'] == True]
-                if final.empty:
-                    st.warning("请勾选要保留的 ASIN")
-                else:
+            # --- 生成文件 ---
+            if st.button("🚀 生成修复版提报单"):
+                selected = edited_df[edited_df['保留'] == True]
+                if not selected.empty:
+                    # 分组：原始行 + 修复折扣（没报错的会在一起，报错修复的会按新折扣分开）
                     output_data = []
-                    # 按 (原始行号 + 建议折扣) 归纳
-                    grouped = final.groupby(['原始行', '建议折扣'])
-                    for (orig_idx, disc), group in grouped:
+                    for (orig_idx, disc), group in selected.groupby(['原始行', '修复折扣']):
                         orig_meta = df_work[df_work['ASIN'] == group['ASIN'].iloc[0]]['meta'].iloc[0]
                         
                         output_data.append({
                             "ASIN 列表": ";".join(group['ASIN'].tolist()),
-                            "折扣百分比": disc,
-                            "每位客户兑换次数限制": "是",
-                            "预算": orig_meta.get(budget_col, 1000),
-                            "名称": f"Fixed-{orig_meta.get(discount_col, '')}%-To-{disc}%",
-                            "开始日期": orig_meta.get(start_col, ""),
-                            "结束日期": orig_meta.get(end_col, "")
+                            "折扣类型（满减€或折扣）": "折扣",
+                            "优惠券“折扣”数值": disc,
+                            "优惠券名称": f"Re-Fixed-{disc}%",
+                            "优惠券预算": orig_meta.get('优惠券预算', 1000),
+                            "优惠券开始日期": orig_meta.get('优惠券开始日期', ""),
+                            "优惠券结束日期": orig_meta.get('优惠券结束日期', ""),
+                            "限制每位买家只能兑换一次": "是"
                         })
                     
-                    res_df = pd.DataFrame(output_data)
-                    st.dataframe(res_df)
+                    final_df = pd.DataFrame(output_data)
+                    st.dataframe(final_df)
                     
-                    excel_out = io.BytesIO()
-                    with pd.ExcelWriter(excel_out, engine='openpyxl') as writer:
-                        res_df.to_excel(writer, index=False)
-                    st.download_button("📥 下载 Excel", excel_out.getvalue(), "Fixed_Coupons.xlsx")
+                    output = io.BytesIO()
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        final_df.to_excel(writer, index=False)
+                    st.download_button("📥 点击下载", output.getvalue(), "Coupon_Fixed_Upload.xlsx")
 
 if __name__ == "__main__":
     main()
