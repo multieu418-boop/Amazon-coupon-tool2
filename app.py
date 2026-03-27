@@ -25,40 +25,62 @@ def parse_error_details(comment_text):
             error_map[asin] = {"req_price": req_p, "reason": reason, "default_decision": "剔除" if auto_exclude else "保留"}
     return error_map
 
-# --- 2. 格式化无损导出函数 ---
+# --- 2. 增强型格式化无损导出函数 ---
 def generate_excel(e_file, master_df, orig_headers):
     e_file.seek(0)
     wb = openpyxl.load_workbook(e_file)
     ws = wb.active
-    # 清空旧数据
-    for r in range(10, ws.max_row + 1):
-        for c in range(1, ws.max_column + 1):
-            ws.cell(row=r, column=c).value = None
+    
+    # 1. 备份第10行开始的所有原始行数据对象，以便后续完整复制整行
+    # key: 原始行号, value: 该行所有单元格的值
+    row_data_backup = {}
+    for r_idx in master_df['原始行号'].unique():
+        row_cells = [ws.cell(row=r_idx, column=c).value for c in range(1, ws.max_column + 1)]
+        row_data_backup[r_idx] = row_cells
+
+    # 2. 清空底稿第10行以后所有数据（为了重新填入）
+    max_r = ws.max_row
+    if max_r >= 10:
+        for r in range(10, max_r + 1):
+            for c in range(1, ws.max_column + 1):
+                ws.cell(row=r, column=c).value = None
 
     final_keep = master_df[master_df['决策'] == "保留"]
     if final_keep.empty:
         return None
 
-    # 定位列
+    # 3. 定位 ASIN 和 折扣列的列索引
     a_idx, d_idx = 1, 3
     for i, h in enumerate(orig_headers, 1):
         if h and 'ASIN' in str(h): a_idx = i
         if h and '折扣' in str(h) and '数值' in str(h): d_idx = i
 
+    # 4. 填入数据
     curr_r = 10
+    # 按“原始行号”和“提报折扣”分组，确保同一行的 ASIN 重新聚合
     for (orig_line, disc), group in final_keep.groupby(['原始行号', '拟提报折扣']):
-        for c in range(1, len(orig_headers) + 1):
-            source = ws.cell(row=orig_line, column=c)
-            target = ws.cell(row=curr_r, column=c)
-            target.value = source.value
-            if source.has_style:
-                target.font, target.border, target.fill = copy(source.font), copy(source.border), copy(source.fill)
-                target.number_format, target.alignment = copy(source.number_format), copy(source.alignment)
+        # A. 完整复制原始行的所有列数据
+        orig_row_values = row_data_backup.get(orig_line)
+        if orig_row_values:
+            for c_idx, val in enumerate(orig_row_values, 1):
+                target_cell = ws.cell(row=curr_r, column=c_idx)
+                target_cell.value = val
+                
+                # B. 复制样式（从原行对应的单元格）
+                source_cell = ws.cell(row=orig_line, column=c_idx)
+                if source_cell.has_style:
+                    target_cell.font = copy(source_cell.font)
+                    target_cell.border = copy(source_cell.border)
+                    target_cell.fill = copy(source_cell.fill)
+                    target_cell.number_format = copy(source_cell.number_format)
+                    target_cell.alignment = copy(source_cell.alignment)
         
+        # C. 精准覆盖 ASIN 串和折扣数值
         ws.cell(row=curr_r, column=a_idx).value = ";".join(group['ASIN'].tolist())
         ws.cell(row=curr_r, column=d_idx).value = disc
         curr_r += 1
 
+    # 5. 删除多余行
     if ws.max_row >= curr_r:
         ws.delete_rows(curr_r, ws.max_row - curr_r + 1)
     
@@ -67,9 +89,8 @@ def generate_excel(e_file, master_df, orig_headers):
     return out_io.getvalue()
 
 def main():
-    st.title("🎯 Amazon Coupon 自动化决策与无损修复系统")
+    st.title("🎯 Amazon Coupon 自动化决策与全行无损修复")
 
-    # 初始化持久状态
     if 'master_df' not in st.session_state:
         st.session_state.master_df = None
         st.session_state.orig_headers = None
@@ -81,21 +102,18 @@ def main():
     reason_kw = st.sidebar.text_input("3. 报错原因关键词过滤")
     
     if st.sidebar.button("🔄 重置并重新上传"):
-        for key in st.session_state.keys(): del st.session_state[key]
+        for key in list(st.session_state.keys()): del st.session_state[key]
         st.rerun()
 
-    # 文件上传
     l_file = st.file_uploader("1. 上传 All Listing 报告", type=['txt', 'xlsx', 'csv'])
     e_file = st.file_uploader("2. 上传带批注的报错模板", type=['xlsx'])
 
-    # 数据处理触发
     if l_file and e_file and st.session_state.master_df is None:
-        with st.spinner("正在解析文件..."):
+        with st.spinner("正在深度解析模板信息..."):
             wb = openpyxl.load_workbook(e_file, data_only=True)
             ws = wb.active
             headers = [cell.value for cell in ws[7]]
             
-            # 读取 Listing 价格
             for enc in ['utf-8', 'utf-16', 'gbk', 'utf-8-sig']:
                 try:
                     l_file.seek(0)
@@ -140,7 +158,6 @@ def main():
             st.session_state.master_df = pd.DataFrame(rows)
             st.session_state.orig_headers = headers
 
-    # 展示与导出（独立于上传逻辑之外，只要有数据就显示）
     if st.session_state.master_df is not None:
         mask = st.session_state.master_df['状态'].isin(status_sel)
         if reason_kw:
@@ -153,29 +170,28 @@ def main():
             df_filtered,
             column_config={
                 "决策": st.column_config.SelectboxColumn("决策", options=["保留", "剔除"]),
-                "详细报错原因": st.column_config.TextColumn("详细报错原因", width="large"),
+                "拟提报折扣": st.column_config.NumberColumn("折扣数值", format="%.2f"),
+                "详细报错原因": st.column_config.TextColumn("报错原因", width="large"),
                 "原始行号": None
             },
             disabled=['ASIN', '状态', '详细报错原因', 'Listing原价', '要求净价'],
-            hide_index=True, use_container_width=True, key="editor_final"
+            hide_index=True, use_container_width=True, key="editor_vfinal"
         )
 
-        # 同步数据
         if not edited.equals(df_filtered):
             for idx in edited.index:
                 st.session_state.master_df.loc[idx, '决策'] = edited.loc[idx, '决策']
                 st.session_state.master_df.loc[idx, '拟提报折扣'] = edited.loc[idx, '拟提报折扣']
             st.rerun()
 
-        # --- 导出区：彻底独立出来 ---
         st.markdown("---")
-        if st.button("🚀 点击生成导出文件", use_container_width=True):
+        if st.button("🚀 生成并导出完整信息 Excel", use_container_width=True):
             file_data = generate_excel(e_file, st.session_state.master_df, st.session_state.orig_headers)
             if file_data:
-                st.success("✅ 文件生成成功！")
-                st.download_button("📥 下载修复后的 Excel", file_data, "Coupon_Fixed.xlsx", "application/vnd.ms-excel")
+                st.success("✅ 文件已成功生成，包含原始模板的所有行信息。")
+                st.download_button("📥 点击下载修复后的完整 Excel", file_data, "Coupon_Full_Info_Fixed.xlsx")
             else:
-                st.error("没有可保留的 ASIN 供导出。")
+                st.error("没有可导出的项。")
 
 if __name__ == "__main__":
     main()
