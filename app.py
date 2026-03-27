@@ -6,190 +6,179 @@ import io
 import openpyxl
 from copy import copy
 
-st.set_page_config(page_title="Amazon Coupon 格式无损修复工具", layout="wide")
+st.set_page_config(page_title="Amazon Coupon 专家修复工具", layout="wide")
 
-# --- 1. 核心解析逻辑：从批注文本中提取 ASIN、报错原因和净价格 ---
-def parse_error_from_comment(comment_text):
+# --- 1. 核心解析逻辑：抓取 ASIN 换行后到“价格”前的话 ---
+def parse_error_details(comment_text):
     error_map = {}
     if not comment_text: return error_map
     
-    # 逻辑：匹配 10位ASIN + 换行 + 紧接着的内容
-    # 正则拆分：以 ASIN 为界
+    # 匹配 10位ASIN + 换行
     blocks = re.split(r'([A-Z0-9]{10})\n', str(comment_text))
     if len(blocks) > 1:
         for i in range(1, len(blocks), 2):
             asin = blocks[i].strip()
             content = blocks[i+1]
             
-            # 提取“要求的净价格”
-            req_price_match = re.search(r'要求的净价格：[^\d]*([\d\.]+)', content)
+            # 提取要求的净价格
+            req_price_match = re.search(r'(?:要求的净价格|当前净价格)：[^\d]*([\d\.]+)', content)
             req_price = float(req_price_match.group(1)) if req_price_match else None
             
-            # 提取“报错原因”：取第一行或“要求的净价格”之前的描述
-            # 常见格式：商品未通过优惠券定价验证。提高优惠券折扣以符合此优惠券的要求。
-            reason = content.split('要求的净价格')[0].strip().replace('\n', ' ')
+            # 提取报错原因：抓取 ASIN 换行后，到“价格”字样之前的所有文本
+            # 过滤掉“商品未通过优惠券定价验证”等冗余，只取核心原因
+            reason_part = re.split(r'(?:要求的净价格|当前净价格)', content)[0]
+            reason = reason_part.strip().replace('\n', ' ')
             
             error_map[asin] = {"req_price": req_price, "reason": reason}
-    else:
-        # 兜底单行处理
-        req_price_match = re.search(r'要求的净价格：[^\d]*([\d\.]+)', str(comment_text))
-        req_price = float(req_price_match.group(1)) if req_price_match else None
-        reason = str(comment_text).split('要求的净价格')[0].strip()
-        error_map["GLOBAL"] = {"req_price": req_price, "reason": reason}
     return error_map
 
-# --- 2. 无损读取函数 ---
-def load_data_for_ui(file):
+# --- 2. 无损读取底稿 ---
+def load_excel_with_meta(file):
     wb = openpyxl.load_workbook(file, data_only=True)
     ws = wb.active
     data = []
-    headers = [cell.value for cell in ws[7]]
+    headers = [cell.value for cell in ws[7]] # 第7行表头
     for row_idx, row in enumerate(ws.iter_rows(min_row=10), 10):
         row_values = [cell.value for cell in row]
         if not any(row_values): continue
-        last_cell = row[-1]
-        comment_text = last_cell.comment.text if last_cell.comment else ""
+        comment = row[-1].comment.text if row[-1].comment else ""
         row_dict = {headers[i]: val for i, val in enumerate(row_values) if i < len(headers)}
-        row_dict['_comment_error'] = comment_text
-        row_dict['_orig_row_idx'] = row_idx
+        row_dict['_comment'] = comment
+        row_dict['_row_idx'] = row_idx
         data.append(row_dict)
     return pd.DataFrame(data), headers
 
-# --- 3. Listing 读取 ---
+# --- 3. Listing 匹配 ---
 def load_listing(file):
-    if file is None: return None
     for enc in ['utf-8', 'utf-16', 'gbk', 'utf-8-sig']:
         try:
             file.seek(0)
-            if file.name.endswith('.txt'):
-                return pd.read_csv(file, sep='\t', encoding=enc)
-            else:
-                return pd.read_excel(file)
+            df = pd.read_csv(file, sep='\t', encoding=enc) if file.name.endswith('.txt') else pd.read_excel(file)
+            df.columns = [c.lower().strip() for c in df.columns]
+            return df
         except: continue
     return None
 
 def main():
-    st.title("🎯 Amazon Coupon 精准修复台")
-    st.info("说明：系统会保留正确 ASIN，并根据批注提取报错原因及建议折扣。导出将维持原文件所有格式。")
+    st.title("🎯 Amazon Coupon 精准修复与无损导出台")
+    
+    # --- 侧边栏：之前的需求回归 ---
+    st.sidebar.header("🔍 筛选与预警设置")
+    status_sel = st.sidebar.multiselect("1. ASIN 状态筛选", ["✅ 正常", "❌ 批注报错"], default=["✅ 正常", "❌ 批注报错"])
+    reason_kw = st.sidebar.text_input("2. 报错原因关键词过滤 (如: 参考价)")
+    discount_limit = st.sidebar.slider("3. 折扣力度红色预警线 (%)", 5, 50, 30) / 100
 
     col1, col2 = st.columns(2)
     with col1:
-        l_file = st.file_uploader("1. 上传 All Listing 报告", type=['txt', 'xlsx', 'csv'])
+        l_file = st.file_uploader("上传 All Listing (查原价)", type=['txt', 'xlsx', 'csv'])
     with col2:
-        e_file = st.file_uploader("2. 上传带【批注】的报错模板", type=['xlsx'])
+        e_file = st.file_uploader("上传带批注的报错模板", type=['xlsx'])
 
     if l_file and e_file:
         df_l = load_listing(l_file)
         e_file.seek(0)
-        df_ui, original_headers = load_data_for_ui(e_file)
+        df_ui, orig_headers = load_excel_with_meta(e_file)
 
         if df_l is not None and df_ui is not None:
-            df_l.columns = [c.lower() for c in df_l.columns]
-            l_asin_col = next((c for c in df_l.columns if 'asin' in c), None)
-            l_price_col = next((c for c in df_l.columns if 'price' in c or '价格' in c), None)
-            e_asin_list_col = next((c for c in df_ui.columns if 'ASIN' in str(c)), df_ui.columns[0])
+            asin_col = next((c for c in df_l.columns if 'asin' in c), None)
+            price_col = next((c for c in df_l.columns if 'price' in c or '价格' in c), None)
+            e_asin_col = next((c for c in df_ui.columns if 'ASIN' in str(c)), df_ui.columns[0])
             e_disc_col = next((c for c in df_ui.columns if '折扣' in str(c) and '数值' in str(c)), None)
 
-            # --- 平铺 ASIN 准备决策 ---
-            rows = []
+            # 铺开数据
+            all_rows = []
             for _, row in df_ui.iterrows():
-                raw_asin_str = str(row.get(e_asin_list_col, ""))
-                asins = [a.strip() for a in raw_asin_str.replace(',', ';').split(';') if a.strip()]
-                err_map = parse_error_from_comment(row.get('_comment_error', ""))
+                asins = [a.strip() for a in str(row.get(e_asin_col, "")).replace(',', ';').split(';') if a.strip()]
+                err_map = parse_error_details(row.get('_comment'))
                 
                 for a in asins:
-                    p_match = df_l[df_l[l_asin_col] == a][l_price_col].values if l_asin_col else []
-                    origin_price = p_match[0] if len(p_match) > 0 else None
+                    p_match = df_l[df_l[asin_col] == a][price_col].values if asin_col else []
+                    orig_p = p_match[0] if len(p_match) > 0 else None
+                    info = err_map.get(a, {})
+                    is_err = a in err_map
                     
-                    is_bad = a in err_map or ("GLOBAL" in err_map and len(asins) == 1)
-                    info = err_map.get(a, err_map.get("GLOBAL", {}))
-                    
-                    # 折扣换算
-                    current_disc = row.get(e_disc_col, 0.05)
-                    suggested = current_disc
-                    if is_bad and origin_price and info.get('req_price'):
-                        needed = math.ceil(((float(origin_price) - float(info.get('req_price'))) / float(origin_price)) * 100)
-                        suggested = needed / 100 if current_disc < 1 else needed
+                    # 自动算折扣
+                    current_d = row.get(e_disc_col, 0.05)
+                    suggested = current_d
+                    if is_err and orig_p and info.get('req_price'):
+                        needed = math.ceil(((float(orig_p) - float(info.get('req_price'))) / float(orig_p)) * 100)
+                        suggested = needed / 100 if current_d < 1 else needed
 
-                    rows.append({
+                    all_rows.append({
                         "决策": "保留",
                         "ASIN": a,
-                        "状态": "❌ 批注报错" if is_bad else "✅ 正常",
-                        "报错原因": info.get('reason', "-"), # 新增列
+                        "状态": "❌ 批注报错" if is_err else "✅ 正常",
+                        "详细报错原因": info.get('reason', "-"),
                         "拟提报折扣": suggested,
-                        "原价": origin_price,
+                        "Listing原价": orig_p,
                         "要求净价": info.get('req_price'),
-                        "原始行号": row.get('_orig_row_idx'),
+                        "原始行号": row.get('_row_idx'),
                         "meta": row.to_dict()
                     })
 
-            df_work = pd.DataFrame(rows)
+            df_work = pd.DataFrame(all_rows)
+            
+            # --- 应用侧边栏筛选 ---
+            mask = df_work['状态'].isin(status_sel)
+            if reason_kw:
+                mask = mask & df_work['详细报错原因'].str.contains(reason_kw)
+            df_display = df_work[mask]
 
-            # --- 决策台渲染 ---
-            st.subheader("🛠️ ASIN 修复决策台")
+            st.subheader("🛠️ ASIN 决策台")
+            # 样式：超过门槛标红
+            def highlight_discount(s):
+                return ['color: red; font-weight: bold' if (isinstance(v, float) and v > discount_limit) else '' for v in s]
+
             edited_df = st.data_editor(
-                df_work[['决策', 'ASIN', '状态', '报错原因', '拟提报折扣', '原价', '要求净价', '原始行号']],
+                df_display[['决策', 'ASIN', '状态', '详细报错原因', '拟提报折扣', 'Listing原价', '要求净价', '原始行号']],
                 column_config={
                     "决策": st.column_config.SelectboxColumn("决策", options=["保留", "剔除"]),
                     "拟提报折扣": st.column_config.NumberColumn("拟提报折扣", format="%.2f"),
-                    "报错原因": st.column_config.TextColumn("报错原因", width="large")
+                    "详细报错原因": st.column_config.TextColumn("详细报错原因", width="large")
                 },
-                disabled=['ASIN', '状态', '报错原因', '原价', '要求净价', '原始行号'],
+                disabled=['ASIN', '状态', '详细报错原因', 'Listing原价', '要求净价', '原始行号'],
                 hide_index=True,
                 use_container_width=True
             )
 
-            # --- 无损导出逻辑 ---
-            if st.button("🚀 格式无损导出 (合并正确+保留项)"):
+            # --- 导出逻辑：全量保留 + 修复剥离 ---
+            if st.button("🚀 格式无损导出 (包含正确+已保留报错ASIN)"):
                 e_file.seek(0)
-                wb_out = openpyxl.load_workbook(e_file)
-                ws_out = wb_out.active
+                wb = openpyxl.load_workbook(e_file)
+                ws = wb.active
+                for r in range(10, ws.max_row + 1): ws.cell(row=r, column=1).value = None 
+
+                # 整合所有保留的 ASIN（包括没在当前筛选页显示的）
+                # 这里逻辑：edited_df 是当前页，我们要把 edited_df 的修改应用回总表，再导出总表中所有“保留”的
+                keep_asins = edited_df[edited_df['决策'] == "保留"]
                 
-                # 清空原数据区（10行以后）
-                for r in range(10, ws_out.max_row + 1):
-                    ws_out.cell(row=r, column=1).value = None 
+                # 确定列索引
+                a_idx, d_idx = 1, 3
+                for i, h in enumerate(orig_headers, 1):
+                    if h and 'ASIN' in str(h): a_idx = i
+                    if h and '折扣' in str(h) and '数值' in str(h): d_idx = i
 
-                # 获取要保留的数据
-                keep_df = edited_df[edited_df['决策'] == "保留"]
-                # 按照原始行+折扣分组，确保不同折扣的剥离成新行
-                grouped = keep_df.groupby(['原始行号', '拟提报折扣'])
+                curr_r = 10
+                for (orig_line, disc), group in keep_asins.groupby(['原始行号', '拟提报折扣']):
+                    # 复制格式
+                    for c in range(1, len(orig_headers) + 1):
+                        source = ws.cell(row=orig_line, column=c)
+                        target = ws.cell(row=curr_r, column=c)
+                        target.value = source.value
+                        if source.has_style:
+                            target.font, target.border, target.fill = copy(source.font), copy(source.border), copy(source.fill)
+                            target.number_format, target.alignment = copy(source.number_format), copy(source.alignment)
+                    
+                    ws.cell(row=curr_r, column=a_idx).value = ";".join(group['ASIN'].tolist())
+                    ws.cell(row=curr_r, column=d_idx).value = disc
+                    curr_r += 1
+
+                if ws.max_row >= curr_r: ws.delete_rows(curr_r, ws.max_row - curr_r + 1)
                 
-                # 确定关键列索引
-                asin_idx = 1
-                disc_idx = 3
-                for i, h in enumerate(original_headers, 1):
-                    if h and 'ASIN' in str(h): asin_idx = i
-                    if h and '折扣' in str(h) and '数值' in str(h): disc_idx = i
-
-                current_row = 10
-                for (orig_line, disc), group in grouped:
-                    new_asin_str = ";".join(group['ASIN'].tolist())
-                    
-                    # 复制格式和元数据
-                    for c in range(1, len(original_headers) + 1):
-                        source_cell = ws_out.cell(row=orig_line, column=c)
-                        target_cell = ws_out.cell(row=current_row, column=c)
-                        target_cell.value = source_cell.value
-                        if source_cell.has_style:
-                            target_cell.font = copy(source_cell.font)
-                            target_cell.border = copy(source_cell.border)
-                            target_cell.fill = copy(source_cell.fill)
-                            target_cell.number_format = copy(source_cell.number_format)
-                            target_cell.alignment = copy(source_cell.alignment)
-                    
-                    # 覆盖 ASIN 列表和折扣
-                    ws_out.cell(row=current_row, column=asin_idx).value = new_asin_str
-                    ws_out.cell(row=current_row, column=disc_idx).value = disc
-                    current_row += 1
-
-                # 删除多余行
-                if ws_out.max_row >= current_row:
-                    ws_out.delete_rows(current_row, ws_out.max_row - current_row + 1)
-
-                out_io = io.BytesIO()
-                wb_out.save(out_io)
-                st.success("导出成功！格式已完美还原。")
-                st.download_button("📥 下载修复后的 Excel 文件", out_io.getvalue(), "Amazon_Fixed_Coupon.xlsx")
+                out = io.BytesIO()
+                wb.save(out)
+                st.success(f"导出成功！已处理 {len(keep_asins)} 个 ASIN。")
+                st.download_button("📥 下载修复后的 Excel", out.getvalue(), "Amazon_Coupon_Final.xlsx")
 
 if __name__ == "__main__":
     main()
